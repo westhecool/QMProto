@@ -1,16 +1,12 @@
 const { WebSocketServer, WebSocket } = require('ws');
-const crypto = require('node:crypto');
 
 class WSConnection {
-    constructor(socket, origin, address) {
+    constructor(socket, origin) {
         this.socket = socket;
         this.origin = origin;
-        this.address = address;
-        this.onMessage = (d) => { };
+        this.onMessage = (data) => { };
         this.onClose = () => { };
-        this.socket.on('message', (d) => {
-            if (d[0] === 0x0A) this.onMessage(d.subarray(1)); // message
-        });
+        this.socket.on('message', (data) => this.onMessage(data));
         this.socket.once('close', () => this.onClose());
     }
 
@@ -18,8 +14,8 @@ class WSConnection {
         return this.socket.readyState === 1;
     }
 
-    sendMessage(message) {
-        this.socket.send(Buffer.concat([new Uint8Array([0x0A]), message]));
+    sendMessage(data) {
+        this.socket.send(data);
     }
 
     close() {
@@ -28,29 +24,42 @@ class WSConnection {
 }
 
 class WSStream {
-    constructor(qprotoInstance) {
-        this.qproto = qprotoInstance;
-        this.server = null;
+    constructor(qmprotoInstance) {
+        this.qmproto = qmprotoInstance;
+        this.servers = [];
         this.clients = [];
-        this.clientReconnectTimeout = 3000;
+        this.clientReconnectTimeout = 2000;
     }
+
     enableServer(bindAddress = '0.0.0.0', bindPort = 8000) {
-        if (this.isServerEnabled()) return;
-        this.server = new WebSocketServer({ port: bindPort, host: bindAddress });
-        this.server.on('connection', (ws, req) => this.qproto._onNewStream(new WSConnection(ws), { origin: 'server', ip: req.socket.remoteAddress, port: req.socket.remotePort }));
+        const key = `${bindAddress}:${bindPort}`;
+        if (this.servers[key]) return;
+        this.servers[key] = new WebSocketServer({ port: bindPort, host: bindAddress });
+        this.servers[key].on('connection', (ws, req) => {
+            ws.on('error', (e) => { });
+            this.qmproto._onNewStream(new WSConnection(ws), { relation: 'client', host: req.socket.remoteAddress, port: req.socket.remotePort });
+        });
     }
-    disableServer() {
-        if (!this.isServerEnabled()) return;
-        this.server.close();
-        this.server = null;
+
+    disableServer(bindAddress = '0.0.0.0', bindPort = 8000) {
+        const key = `${bindAddress}:${bindPort}`;
+        if (!this.servers[key]) return false;
+        this.servers[key].close();
+        delete this.servers[key];
+        return true;
     }
-    isServerEnabled() {
-        return this.server !== null;
+
+    isServerEnabled(bindAddress = '0.0.0.0', bindPort = 8000) {
+        const key = `${bindAddress}:${bindPort}`;
+        return Boolean(this.servers[key]);
     }
+
     addConnection(server) {
+        const proto = server.split('://')[0];
+        if (proto !== 'ws' && proto !== 'wss') throw new Error('Invalid protocol!');
         const key = server.split('://')[1];
-        const ip = key.split(':')[0];
-        const port = key.split(':')[1] || (server.startsWith('wss://') ? 443 : 80);
+        const host = key.split(':')[0];
+        const port = parseInt(key.split(':')[1] || ((proto === 'wss') ? 443 : 80));
         if (this.clients[key]) return false;
         this.clients[key] = {
             server,
@@ -61,11 +70,12 @@ class WSStream {
             this.removeConnection(key);
             setTimeout(() => this.addConnection(server), this.clientReconnectTimeout);
         });
-        this.clients[key].socket.once('open', (d) => {
-            this.qproto._onNewStream(new WSConnection(this.clients[key].socket), { origin: 'client', ip, port });
+        this.clients[key].socket.once('open', () => {
+            this.qmproto._onNewStream(new WSConnection(this.clients[key].socket), { relation: 'server', host, port });
         })
         return true;
     }
+
     removeConnection(server) {
         if (!this.clients[server]) return false;
         try {

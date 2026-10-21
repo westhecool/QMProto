@@ -1,257 +1,423 @@
 const process = require('node:process');
 if (!process.versions.openssl.startsWith('3.5.')) throw new Error(`[QMPROTO]: Missing OpenSSL version >= 3.5.0 (current: ${process.versions.openssl})`);
 global.QMPROTO_DEBUG_FN = (...args) => { if (process.env.QMPROTO_DEBUG == 'true' || process.env.QMPROTO_DEBUG == '1') console.log('[QMPROTO-DEBUG]:', ...args); };
+global.QMPROTO_ROUTER_DEBUG_FN = (...args) => { if (process.env.QMPROTO_ROUTER_DEBUG == 'true' || process.env.QMPROTO_ROUTER_DEBUG == '1') console.log('[QMPROTO-ROUTER-DEBUG]:', ...args); };
 const Crypto = require('./crypto.js');
 const { EventEmitter } = require('node:events');
 const { MESSAGES } = require('./constants.js');
 
 class QMProto extends EventEmitter {
-    constructor({ keyDirectory, maxMessageSize, maxMessageForwardSize, sendHelloOnConnect, respondToDiscover, locateTimeout } = {}) {
+    constructor({ keyDirectory, maxMessagePayloadSize, maxMessageForwardSize, sendHelloOnConnect, respondToBroadcastPing } = {}) {
         super();
-        if (typeof maxMessageSize !== 'number') maxMessageSize = 20 * 1024 * 1024;
-        if (typeof maxMessageForwardSize !== 'number') maxMessageForwardSize = 20 * 1024 * 1024;
-        if (typeof sendHelloOnConnect !== 'boolean') sendHelloOnConnect = false;
-        if (typeof respondToDiscover !== 'boolean') respondToDiscover = true;
-        if (typeof locateTimeout !== 'number') locateTimeout = 6000;
-        this.maxMessageSize = maxMessageSize;
+        if (typeof maxMessagePayloadSize !== 'number') maxMessagePayloadSize = (20 * 1024 * 1024) + 4096; // 20MB + overhead for encryption
+        if (typeof maxMessageForwardSize !== 'number') maxMessageForwardSize = (20 * 1024 * 1024) + 8192; // 20MB + overhead for proto & encryption
+        if (typeof sendHelloOnConnect !== 'boolean') sendHelloOnConnect = true;
+        if (typeof respondToBroadcastPing !== 'boolean') respondToBroadcastPing = true;
+
+        this.maxMessagePayloadSize = maxMessagePayloadSize;
         this.maxMessageForwardSize = maxMessageForwardSize;
         this.sendHelloOnConnect = sendHelloOnConnect;
-        this.respondToDiscover = respondToDiscover;
-        this.locateTimeout = locateTimeout;
+        this.respondToBroadcastPing = respondToBroadcastPing;
+
         this.crypto = new Crypto(keyDirectory);
         this.identity = this.crypto.publicKeyId;
         this.identityString = this.crypto.publicKeyIdString;
+
+        this.knownPeersTTL = 300; // <<< Queries longer then 300s will fail!
+        this.messagePacketTimeoutMS = 1000;
+
         this.streams = {};
         this.knownPeers = {};
-        this.broadcastIdentity = Buffer.alloc(32).fill(0xFF);
-        this._knownPeersCleanupInterval = setInterval(() => this._cleanupKnownPeers(), 3000);
-        this.recevedMessages = {};
-        this._recevedMessagesCleanupInterval = setInterval(() => this._cleanupReceivedMessages(), 3000);
-        this._pingCBs = {};
-        this._queryCBs = {};
+        this.activeSessionRequestChallenges = {};
+        this.broadcastIdentityString = Buffer.alloc(32).fill(0xFF).toString('hex');
+        this.receivedMessages = {};
+        this._messageCBs = {};
+
+        this._cleanupInterval = setInterval(() => this._cleanupLoop(), 3000);
     }
+
     _genId() {
         const buf = Buffer.alloc(8);
         buf.writeBigUInt64BE(BigInt(Date.now()));
         buf.writeUInt16BE(Math.floor(Math.random() * 0xFFFF)); // Overwrite the first 2 bytes (00 00) with a random number
         return buf;
     }
+
     _onNewStream(stream, streamSourceInfo) {
         const streamId = this._genId().toString('hex');
         try {
-            stream.onMessage = (data) => this._onMessage(streamId, data);
-            stream.onClose = () => { };
             this.streams[streamId] = stream;
             this.streams[streamId].onMessage = (data) => this._onRawMessage(streamId, data);
             this.streams[streamId].onClose = () => this._onStreamClose(streamId);
-            if (this.sendHelloOnConnect) this.streams[streamId].sendMessage(this._encodeMessage(this.broadcastIdentity, MESSAGES.HELLO).buffer);
+            if (this.sendHelloOnConnect) this.streams[streamId].sendMessage(this._encodeResponse(this.broadcastIdentityString, MESSAGES.HELLO, Buffer.alloc(8).fill(0xFF)).buffer);
         } catch (e) {
             QMPROTO_DEBUG_FN(`Error registering stream ${streamId}:`, e.message);
         }
     }
+
     _onStreamClose(streamId) {
-        for (const peer in this.knownPeers) if (this.knownPeers[peer][0] === streamId) this._markPeerAsDead(peer);
+        for (const peer in this.knownPeers) if (this.knownPeers[peer][0] === streamId) delete this.knownPeers[peer];
         delete this.streams[streamId];
     }
+
     _onRawMessage(streamId, data) {
         try {
             const msg = this._decodeMessage(data);
-            if (msg.senderIdentityString === this.identityString) return; // Ignore our own messages that may have been forwarded to us
+            if (msg.senderIdentityString === this.identityString) return; // Ignore our own messages that may have been forwarded back to us
+
             if (this.knownPeers[msg.senderIdentityString]) {
-                if (this.knownPeers[msg.senderIdentityString][0] !== streamId) this.knownPeers[msg.senderIdentityString][0] = streamId;
-                this.knownPeers[msg.senderIdentityString][2] = Math.floor(Date.now() / 1000) + 60;
+                if (this.knownPeers[msg.senderIdentityString][0] !== streamId) this.knownPeers[msg.senderIdentityString][0] = streamId; // Make sure the routing stream is up to date
+                this.knownPeers[msg.senderIdentityString][1] = Math.floor(Date.now() / 1000); // Update last seen at
+            } else {
+                this.knownPeers[msg.senderIdentityString] = [streamId, Math.floor(Date.now() / 1000), null, null]; // StreamId, last seen at, active session key, active session hash
             }
-            else this.knownPeers[msg.senderIdentityString] = [streamId, msg.senderPubKey, Math.floor(Date.now() / 1000) + 60];
-            if (this.recevedMessages[msg.idString]) return; // Ignore duplicate messages
-            this.recevedMessages[msg.idString] = Math.floor(Date.now() / 1000) + 5;
-            // Messages that could be broadcast
-            if ((msg.message === MESSAGES.HELLO || msg.message === MESSAGES.DISCOVER) && (msg.recipientString === this.identityString || this._checkIfBroadcast(msg.recipient))) {
-                switch (msg.message) {
-                    case MESSAGES.HELLO:
-                        this.emit('new-peer', msg, msg.senderIdentityString);
-                        break;
-                    case MESSAGES.DISCOVER:
-                        this.emit('discover-request', msg);
-                        if (this.respondToDiscover) this.streams[streamId].sendMessage(this._encodeMessage(msg.senderIdentity, MESSAGES.HELLO).buffer);
-                        break;
-                }
+
+            if (msg.code === MESSAGES.HELLO) this.emit('new-peer', msg, msg.senderIdentityString);
+
+            // PING can be broadcast
+            if ((msg.code === MESSAGES.PING) && (msg.recipientString === this.identityString || msg.recipientString === this.broadcastIdentityString)) {
+                this.emit('ping', msg, msg.senderIdentityString);
+                if ((msg.recipientString === this.identityString) || (msg.recipientString === this.broadcastIdentityString && this.respondToBroadcastPing)) this.streams[streamId].sendMessage(this._encodeResponse(msg.senderIdentity, MESSAGES.PONG, msg.id).buffer);
             }
+
             if (msg.recipientString === this.identityString) {
-                if ((msg.encryptedPayload.length - 1596) > this.maxMessageSize) { // 1596b encryption overhead
-                    QMPROTO_DEBUG_FN(`Dropping message with payload too large (${msg.encryptedPayload.length} bytes > max ${this.maxMessageSize} bytes)`);
+                if (this.receivedMessages[msg.idString]) return; // Ignore duplicate messages
+                this.receivedMessages[msg.idString] = Math.floor(Date.now() / 1000) + 5;
+
+                if (msg.payload.length > this.maxMessagePayloadSize) {
+                    QMPROTO_DEBUG_FN(`Dropping message with payload too large (${msg.payload.length} bytes > max ${this.maxMessagePayloadSize} bytes)`);
                     return;
                 }
-                let payload = new Uint8Array(0);
-                switch (msg.message) {
-                    case MESSAGES.PING:
-                        if (msg.encryptedPayload.length > 0) payload = this.crypto.decrypt(msg.encryptedPayload);
-                        this.emit('ping', msg);
-                        this.streams[streamId].sendMessage(this._encodeMessage(msg.senderIdentity, MESSAGES.PONG, this.crypto.encrypt(msg.senderPubKey, msg.id)).buffer);
-                        break;
-                    case MESSAGES.PONG:
-                        if (msg.encryptedPayload.length > 0) payload = this.crypto.decrypt(msg.encryptedPayload);
-                        this.emit('pong', msg);
-                        if (payload.length === 8 && this._pingCBs[payload.toString('hex')]) this._pingCBs[payload.toString('hex')](0);
-                        break;
-                    case MESSAGES.ANOUNCE:
-                        if (msg.encryptedPayload.length > 0) payload = this.crypto.decrypt(msg.encryptedPayload);
-                        this.emit('announcement', msg, payload);
-                        break;
-                    case MESSAGES.QUERY:
-                        if (msg.encryptedPayload.length > 0) payload = this.crypto.decrypt(msg.encryptedPayload);
-                        this.emit('query', msg, payload, async (data = new Uint8Array(0)) => await this._sendQueryResponse(msg, MESSAGES.QUERY_SUCCESS, data), async (data = new Uint8Array(0)) => await this._sendQueryResponse(msg, MESSAGES.QUERY_FAILURE, data), async (data = new Uint8Array(0)) => await this._sendQueryResponse(msg, MESSAGES.QUERY_REFUSED, data));
-                        break;
-                    case MESSAGES.QUERY_SUCCESS:
-                        if (msg.encryptedPayload.length > 0) payload = this.crypto.decrypt(msg.encryptedPayload);
-                        if (payload.length >= 8) {
-                            const k = payload.subarray(0, 8).toString('hex');
-                            if (this._queryCBs[k]) this._queryCBs[k]([0, 0, payload.subarray(8)]);
-                        }
-                        break;
-                    case MESSAGES.QUERY_FAILURE:
-                        if (msg.encryptedPayload.length > 0) payload = this.crypto.decrypt(msg.encryptedPayload);
-                        if (payload.length >= 8) {
-                            const k = payload.subarray(0, 8).toString('hex');
-                            if (this._queryCBs[k]) this._queryCBs[k]([0, 1, payload.subarray(8)]);
-                        }
-                        break;
-                    case MESSAGES.QUERY_REFUSED:
-                        if (msg.encryptedPayload.length > 0) payload = this.crypto.decrypt(msg.encryptedPayload);
-                        if (payload.length >= 8) {
-                            const k = payload.subarray(0, 8).toString('hex');
-                            if (this._queryCBs[k]) this._queryCBs[k]([0, 2, payload.subarray(8)]);
-                        }
-                        break;
+
+                if (msg.type === 0) { // Requests
+                    switch (msg.code) {
+                        case MESSAGES.REQUEST_PUBKEY:
+                            this.streams[streamId].sendMessage(this._encodeResponse(msg.senderIdentity, MESSAGES.PUBKEY, msg.id, this.crypto.publicKeyRaw).buffer);
+                            break;
+                        case MESSAGES.SESSION_INIT_STAGE1:
+                            // 1568b sender pub key + 1568b hmac key cipher + 32b seed
+                            if (!msg.payload || msg.payload.length !== 3168) return; // Invalid request
+
+                            QMPROTO_DEBUG_FN(`{SESSION} [${msg.senderIdentityString.substring(0, 16)}] Requested a new session. Solving their challenge and sending our one back.`);
+
+                            const senderPubKey = msg.payload.subarray(0, 1568);
+                            if (!this.crypto.timingSafeEqual(this.crypto.hash(senderPubKey), msg.senderIdentity)) return; // Someone is up to no good
+
+                            const requestChallengeResponse = this.crypto.solveChallenge(msg.payload.subarray(1568));
+                            const { expectedResponse, challengeBuffer: newChallengeBuffer } = this.crypto.createChallenge(senderPubKey);
+
+                            this.activeSessionRequestChallenges[msg.senderIdentityString] = [Math.floor(Date.now() / 1000) + 5, expectedResponse];
+
+                            this.streams[streamId].sendMessage(this._encodeResponse(msg.senderIdentity, MESSAGES.SESSION_INIT_STAGE1_RESPONSE, msg.id, Buffer.concat([requestChallengeResponse, newChallengeBuffer])).buffer);
+                            break;
+                        case MESSAGES.SESSION_INIT_STAGE2:
+                            // 1568b sender pub key + 32b challenge response
+                            if (!msg.payload || msg.payload.length !== 1600) return; // Invalid request
+
+                            const senderPubKey2 = msg.payload.subarray(0, 1568);
+                            if (!this.crypto.timingSafeEqual(this.crypto.hash(senderPubKey2), msg.senderIdentity)) return; // Someone is up to no good
+
+                            const challengeResponse = msg.payload.subarray(1568);
+
+                            if (this.activeSessionRequestChallenges[msg.senderIdentityString] && this.crypto.timingSafeEqual(this.activeSessionRequestChallenges[msg.senderIdentityString][1], challengeResponse)) {
+                                delete this.activeSessionRequestChallenges[msg.senderIdentityString];
+                                QMPROTO_DEBUG_FN(`{SESSION} [${msg.senderIdentityString.substring(0, 16)}] Solved our challenge successfully. Granting new session.`);
+                                const sessionKey = this.crypto.randomBytes(32);
+                                this.knownPeers[msg.senderIdentityString][2] = sessionKey; // Update current session key
+                                this.knownPeers[msg.senderIdentityString][3] = this.crypto.hash(sessionKey); // Update current session hash
+                                this.streams[streamId].sendMessage(this._encodeResponse(msg.senderIdentity, MESSAGES.SESSION_INFO, msg.id, this.crypto.PKIEncrypt(senderPubKey2, sessionKey)).buffer);
+                            } else {
+                                QMPROTO_DEBUG_FN(`{SESSION} [${msg.senderIdentityString.substring(0, 16)}] Failed our challenge!`);
+                                this.streams[streamId].sendMessage(this._encodeResponse(msg.senderIdentity, MESSAGES.SESSION_INVALID, msg.id).buffer);
+                            }
+                            break;
+                        case MESSAGES.QUERY:
+                            if (this.knownPeers[msg.senderIdentityString][2] !== null && this.knownPeers[msg.senderIdentityString][3].equals(msg.payload.subarray(0, 32))) { // Check if session hash matches or not
+                                const payload = this.crypto.AESDecrypt(this.knownPeers[msg.senderIdentityString][2], msg.payload.subarray(32));
+                                this.streams[streamId].sendMessage(this._encodeResponse(msg.senderIdentity, MESSAGES.ACKNOWLEDGED, msg.id).buffer);
+                                this.emit('query', msg, msg.senderIdentityString, payload, async (data = new Uint8Array(0)) => await this._sendQueryResponse(streamId, msg, MESSAGES.QUERY_SUCCESS, data), async (data = new Uint8Array(0)) => await this._sendQueryResponse(streamId, msg, MESSAGES.QUERY_FAILURE, data), async (data = new Uint8Array(0)) => await this._sendQueryResponse(streamId, msg, MESSAGES.QUERY_REFUSED, data));
+                            } else {
+                                this.streams[streamId].sendMessage(this._encodeResponse(msg.senderIdentity, MESSAGES.SESSION_INVALID, msg.id).buffer);
+                            }
+                            break;
+                    }
+                } else if (msg.type === 1) { // Responses
+                    switch (msg.code) {
+                        case MESSAGES.PONG:
+                            this.emit('pong', msg, msg.senderIdentityString);
+                            break;
+                    }
+
+                    if (this._messageCBs[msg.requestIdString]) this._messageCBs[msg.requestIdString]([msg.code, msg.payload]); // Hand back the message to the function that issued the request
                 }
             } else {
-                if ((msg.encryptedPayload.length - 1596) > this.maxMessageForwardSize) { // 1596b encryption overhead
-                    QMPROTO_DEBUG_FN(`Dropping message forward with payload too large (${msg.encryptedPayload.length} bytes > max ${this.maxMessageForwardSize} bytes)`);
+                if (data.length > this.maxMessageForwardSize) {
+                    QMPROTO_ROUTER_DEBUG_FN(`Dropping message to forward that is too large (${data.length} bytes > max ${this.maxMessageForwardSize} bytes)`);
                     return;
                 }
-                if (this.knownPeers[msg.recipientString] && !this._checkIfBroadcast(msg.recipient)) {
-                    this.streams[this.knownPeers[msg.recipientString][0]].sendMessage(data);
-                } else {
-                    for (const stream in this.streams) {
-                        if (stream === streamId) continue; // Don't forward the message back to the sender
-                        this.streams[stream].sendMessage(data);
-                    }
-                }
+                QMPROTO_ROUTER_DEBUG_FN(`Forwarding message [${msg.idString}] ${msg.senderIdentityString.substring(0, 16)} -> ${msg.recipientString.substring(0, 16)} (${data.length}b)`)
+                this._send(msg.recipientString, data, streamId); // Don't forward the message back to the sender stream
             }
         } catch (e) {
             QMPROTO_DEBUG_FN('Error decoding incoming message:', e.message);
-            throw e;
         }
     }
-    _cleanupReceivedMessages() {
-        for (const id in this.recevedMessages) {
-            if (Math.floor(Date.now() / 1000) > this.recevedMessages[id]) {
-                delete this.recevedMessages[id];
-            }
-        }
+
+    async _sendQueryResponse(streamId, msg, message, data) {
+        if (!this.knownPeers[msg.senderIdentityString]) throw new Error('Unable to send response: peer is unknown.');
+        if (this.knownPeers[msg.senderIdentityString][2] === null) throw new Error('Unable to send response: peer session is unknown.');
+        if (typeof data === 'string') data = Buffer.from(data);
+        const res_data = this.crypto.AESEncrypt(this.knownPeers[msg.senderIdentityString][2], data);
+        this.streams[streamId].sendMessage(this._encodeResponse(msg.senderIdentity, message, msg.id, res_data).buffer);
     }
-    _cleanupKnownPeers() {
-        for (const peer in this.knownPeers) {
-            if (Math.floor(Date.now() / 1000) > this.knownPeers[peer][2]) {
-                this._markPeerAsDead(peer);
-            }
-        }
+
+    _cleanupLoop() {
+        for (const id in this.activeSessionRequestChallenges) if (Math.floor(Date.now() / 1000) > this.activeSessionRequestChallenges[id][0]) delete this.receivedMessages[id];
+        for (const id in this.receivedMessages) if (Math.floor(Date.now() / 1000) > this.receivedMessages[id]) delete this.receivedMessages[id]; // TODO: NEEDS WORK
+        for (const peer in this.knownPeers) if (Math.floor(Date.now() / 1000) > (this.knownPeers[peer][1] + this.knownPeersTTL)) delete this.knownPeers[peer];
     }
-    _checkIfBroadcast(buf) {
-        if (typeof buf === 'string') buf = Buffer.from(buf, 'hex');
-        for (let i = 0; i < buf.length; i++) if (buf[i] !== 0xFF) return false;
-        return true;
-    }
-    _markPeerAsDead(peer) {
-        delete this.knownPeers[peer];
-    }
-    _encodeMessage(recipient, message, payload = new Uint8Array(0)) {
+
+    _encodeRequest(recipient, code, payload = new Uint8Array(0)) {
         if (typeof recipient === 'string') recipient = Buffer.from(recipient, 'hex');
+
         const version = Buffer.alloc(4);
         version.writeUInt32BE(1); // For later use
+
         const id = this._genId();
         const idString = id.toString('hex');
-        const msg = Buffer.alloc(4);
-        msg.writeUInt32BE(message);
-        return { id, idString, buffer: Buffer.concat([version, id, recipient, this.crypto.publicKeyRaw, msg, payload]) };
+
+        const codeBuf = Buffer.alloc(4);
+        codeBuf.writeUInt32BE(code);
+
+        return { id, idString, buffer: Buffer.concat([version, id, recipient, this.identity, codeBuf, payload]) };
     }
-    _decodeMessage(data) {
-        // 4b version + 8b id + 32b recipient + 1568b sender public key + 4b message + payload
-        if (data.length < 1616) throw new Error('Invalid message size');
-        let offset = 0;
-        const version = data.readUInt32BE(offset);
-        offset += 4;
-        if (version !== 1) throw new Error('Unknown message version');
-        const id = data.subarray(offset, offset + 8);
-        offset += 8;
+
+    _encodeResponse(recipient, code, requestId, payload = new Uint8Array(0)) {
+        if (typeof recipient === 'string') recipient = Buffer.from(recipient, 'hex');
+        if (typeof requestId === 'string') requestId = Buffer.from(requestId, 'hex');
+
+        const version = Buffer.alloc(4);
+        version.writeUInt32BE(1); // For later use
+
+        const id = this._genId();
         const idString = id.toString('hex');
-        const recipient = data.subarray(offset, offset + 32);
-        offset += 32;
-        const recipientString = recipient.toString('hex');
-        const senderPubKey = data.subarray(offset, offset + 1568);
-        offset += 1568;
-        const senderIdentity = this.crypto.hash(senderPubKey, 'sha3-256');
-        const senderIdentityString = senderIdentity.toString('hex');
-        const message = data.readUInt32BE(offset);
+
+        const codeBuf = Buffer.alloc(4);
+        codeBuf.writeUInt32BE(code);
+
+        return { id, idString, buffer: Buffer.concat([version, id, recipient, this.identity, codeBuf, requestId, payload]) };
+    }
+
+    _decodeMessage(data) {
+        // 4b version + 8b id + 32b recipient + 32b sender + 4b message [+ 8b request id] + data
+        if (data.length < 80) throw new Error('Invalid message size.');
+        let type = 0;
+        let offset = 0;
+
+        const version = data.readUInt32BE(offset);
+        if (version !== 1) throw new Error('Unknown message version.');
         offset += 4;
-        const encryptedPayload = data.subarray(offset);
-        return { version, id, idString, recipient, recipientString, senderPubKey, senderIdentity, senderIdentityString, message, encryptedPayload };
-    }
-    async locate(identity) {
-        const start = Date.now();
-        while (!this.knownPeers[identity]) {
-            if (this.locateTimeout !== 0 && Date.now() - start > this.locateTimeout) throw new Error('Locate timed out');
-            for (const stream in this.streams) this.streams[stream].sendMessage(this._encodeMessage(identity, MESSAGES.PING).buffer);
-            await new Promise(resolve => setTimeout(resolve, 500));
+
+        const id = data.subarray(offset, offset + 8);
+        const idString = id.toString('hex');
+        offset += 8;
+
+        const recipient = data.subarray(offset, offset + 32);
+        const recipientString = recipient.toString('hex');
+        offset += 32;
+
+        const senderIdentity = data.subarray(offset, offset + 32);
+        const senderIdentityString = senderIdentity.toString('hex');
+        offset += 32;
+
+        const code = data.readUInt32BE(offset);
+        offset += 4;
+
+        let requestId = null, requestIdString = null;
+        if (code >= 1_000_000 && code < 2_000_000) { // Response
+            type = 1;
+            requestId = data.subarray(offset, offset + 8);
+            requestIdString = requestId.toString('hex');
+            offset += 8;
         }
-        return true;
+
+        const payload = data.subarray(offset);
+
+        return { version, type, id, idString, requestId, requestIdString, recipient, recipientString, senderIdentity, senderIdentityString, code, payload };
     }
-    async ping(identity, timeout = 1000, trys = 1) {
-        for (let i = 0; i < trys; i++) {
-            try {
-                if (!this.knownPeers[identity]) await this.locate(identity);
-            } catch (e) {
-                return false; // Peer not found
+
+    _send(identity, data, skip = null) {
+        if (this.knownPeers[identity] && identity !== this.broadcastIdentityString) {
+            this.streams[this.knownPeers[identity][0]].sendMessage(data);
+        } else {
+            for (const streamId in this.streams) {
+                if (skip !== null && streamId === skip) continue;
+                this.streams[streamId].sendMessage(data);
             }
-            const message = this._encodeMessage(identity, MESSAGES.PING);
-            this.streams[this.knownPeers[identity][0]].sendMessage(message.buffer);
-            if (timeout > 0) setTimeout(() => { if (this._pingCBs[message.idString]) this._pingCBs[message.idString](1); }, timeout);
-            const res = await new Promise(resolve => this._pingCBs[message.idString] = resolve);
-            delete this._pingCBs[message.idString];
-            if (res === 0) return true; // Success
-            else if (res === 1) continue; // Timeout
         }
-        this._markPeerAsDead(identity);
+    }
+
+    async _sendAndWait(identity, message, res_timeout = 30000, ack_timeout = 10000) {
+        let res_elapsed = 0;
+        let ack_elapsed = 0;
+        let res_received = false;
+        let ack_received = false;
+        let res = null;
+        let cb = null;
+
+        this._messageCBs[message.idString] = ([res_message, res_data]) => {
+            res = [res_message, res_data];
+            if (res_message === MESSAGES.ACKNOWLEDGED) ack_received = true;
+            else res_received = true;
+            if (typeof cb === 'function') cb();
+        };
+
+        while (true) {
+            setImmediate(async () => {
+                while (true) {
+                    let ack_wait = !ack_received;
+                    try {
+                        if (!ack_received) this._send(identity, message.buffer);
+                    } catch (e) { }
+
+                    await new Promise((r) => setTimeout(r, this.messagePacketTimeoutMS));
+                    if (res_received || (ack_wait && ack_received)) break;
+
+                    if (!ack_received) {
+                        ack_elapsed += this.messagePacketTimeoutMS;
+                        if (ack_timeout > 0 && ack_elapsed >= ack_timeout && this._messageCBs[message.idString]) {
+                            this._messageCBs[message.idString]([-1, null]);
+                            break;
+                        }
+                    } else {
+                        res_elapsed += this.messagePacketTimeoutMS;
+                        if (res_timeout > 0 && res_elapsed >= res_timeout && this._messageCBs[message.idString]) {
+                            this._messageCBs[message.idString]([-1, null]);
+                            break;
+                        }
+                    }
+                }
+            });
+
+            if (!res_received) await new Promise(r => cb = r);
+
+            if (res[0] === -1) { // Timeout
+                delete this._messageCBs[message.idString];
+                if (!ack_received) {
+                    throw new Error('Timeout waiting for request acknowledgement from peer.');
+                } else {
+                    throw new Error('Timeout waiting for response from peer.');
+                }
+            } else if (res[0] !== MESSAGES.ACKNOWLEDGED) {
+                delete this._messageCBs[message.idString];
+                return res;
+            }
+        }
+    }
+
+    async requestSession(identity, timeout = 6000) {
+        if (typeof identity !== 'string') throw new Error('Identity is required.');
+
+        if (!(await this.ping(identity, timeout))) throw new Error('Failed to ping peer.');
+
+        const peerPubKey = await this.requestPublicKey(identity, timeout);
+        const peerIdentityString = this.crypto.hash(peerPubKey).toString('hex');
+
+        QMPROTO_DEBUG_FN(`{SESSION} Requesting new session from [${peerIdentityString.substring(0, 16)}].`);
+
+        const { expectedResponse, challengeBuffer } = this.crypto.createChallenge(peerPubKey);
+
+        const message = this._encodeRequest(identity, MESSAGES.SESSION_INIT_STAGE1, Buffer.concat([this.crypto.publicKeyRaw, challengeBuffer]));
+        const [res_message, res_data] = await this._sendAndWait(identity, message, timeout, timeout);
+        if (res_message !== MESSAGES.SESSION_INIT_STAGE1_RESPONSE) throw new Error('Received bad response code.');
+        // 32b challenge response + new challenge for us (1568b hmac key cipher + 32b seed)
+        if (res_data.length < 1632) throw new Error('Received bad response data.');
+
+        const receivedResponse = res_data.subarray(0, 32);
+        const valid = (expectedResponse.length === receivedResponse.length) && this.crypto.timingSafeEqual(expectedResponse, receivedResponse);
+
+        if (valid) {
+            QMPROTO_DEBUG_FN(`{SESSION} [${peerIdentityString.substring(0, 16)}] Solved our challenge successfully. Now solving their challenge and sending it back.`);
+
+            const challengeResponse = this.crypto.solveChallenge(res_data.subarray(32));
+
+            const message2 = this._encodeRequest(identity, MESSAGES.SESSION_INIT_STAGE2, Buffer.concat([this.crypto.publicKeyRaw, challengeResponse]));
+            const [res_message2, res_data2] = await this._sendAndWait(identity, message2, timeout, timeout);
+            if (res_message2 !== MESSAGES.SESSION_INFO) throw new Error('Received bad response code.');
+            // Encrypted new session key (1568b shared key + 12b iv + cipherText + 16b auth tag)
+            if (res_data2.length <= 1596) throw new Error('Received bad response data.');
+
+            const sessionKey = this.crypto.PKIDecrypt(res_data2);
+
+            QMPROTO_DEBUG_FN(`{SESSION} Successfully got a new session from [${peerIdentityString.substring(0, 16)}].`);
+
+            this.knownPeers[identity][2] = sessionKey; // Update current session key
+            this.knownPeers[identity][3] = this.crypto.hash(sessionKey); // Update current session hash
+
+            return true;
+        } else {
+            QMPROTO_DEBUG_FN(`{SESSION} [${peerIdentityString.substring(0, 16)}] Failed our challenge!`);
+            throw new Error('Remote peer failed our challenge!');
+        }
+    }
+
+    async requestPublicKey(identity, timeout = 6000) {
+        if (typeof identity !== 'string') throw new Error('Identity is required.');
+        const message = this._encodeRequest(identity, MESSAGES.REQUEST_PUBKEY);
+        const [res_message, res_data] = await this._sendAndWait(identity, message, timeout, timeout);
+        if (res_message !== MESSAGES.PUBKEY) throw new Error('Received bad response code.');
+        if (!this.crypto.timingSafeEqual(this.crypto.hash(res_data), Buffer.from(identity, 'hex'))) throw new Error('Peer sent a key that does not match their identity!'); // Someone is up to no good
+        return res_data;
+    }
+
+    async sendBroadcastPing() {
+        const message = this._encodeRequest(this.broadcastIdentityString, MESSAGES.PING);
+        this._send(this.broadcastIdentityString, message.buffer);
+    }
+
+    async ping(identity, timeout = 1000) {
+        if (typeof identity !== 'string') throw new Error('Identity is required.');
+        const message = this._encodeRequest(identity, MESSAGES.PING);
+        try {
+            const [res_message, res_data] = await this._sendAndWait(identity, message, timeout, timeout);
+            if (res_message !== MESSAGES.PONG) throw new Error('Received bad response code.');
+            return true;
+        } catch (e) { }
+        delete this.knownPeers[identity]; // Mark the peer as dead
         return false;
     }
-    async anounce(identity, data) {
-        if (!this.knownPeers[identity]) await this.locate(identity);
-        if (typeof data === 'string') data = Buffer.from(data);
-        if (data.length > this.maxMessageSize) throw new Error('Message data too large');
-        const message = this._encodeMessage(identity, MESSAGES.ANOUNCE, data.length > 0 ? this.crypto.encrypt(this.knownPeers[identity][1], data) : data);
-        this.streams[this.knownPeers[identity][0]].sendMessage(message.buffer);
-    }
-    async query(identity, data, timeout = 0, trys = 1) {
-        for (let i = 0; i < trys; i++) {
-            if (!this.knownPeers[identity]) await this.locate(identity);
-            if (typeof data === 'string') data = Buffer.from(data);
-            if (data.length > this.maxMessageSize) throw new Error('Message data too large');
-            const message = this._encodeMessage(identity, MESSAGES.QUERY, data.length > 0 ? this.crypto.encrypt(this.knownPeers[identity][1], data) : data);
-            this.streams[this.knownPeers[identity][0]].sendMessage(message.buffer);
-            if (timeout > 0) setTimeout(() => { if (this._queryCBs[message.idString]) this._queryCBs[message.idString]([1, 0, new Uint8Array(0)]); }, timeout);
-            const [was_timeout, rstate, rdata] = await new Promise(resolve => this._queryCBs[message.idString] = resolve);
-            delete this._queryCBs[message.idString];
-            if (was_timeout === 0) return [rstate, rdata]; // Success
-            else if (was_timeout === 1) throw new Error('Query timed out'); // Timeout
+
+    async query(identity, data, res_timeout = 30000, ack_timeout = 10000) {
+        if (typeof identity !== 'string') throw new Error('Identity is required.');
+        if (!data || data.length < 0) throw new Error('Data is required.');
+        if (!this.knownPeers[identity] || this.knownPeers[identity][2] === null) await this.requestSession(identity);
+        let triedNewSession = false;
+        while (true) {
+            const payload = this.crypto.AESEncrypt(this.knownPeers[identity][2], data);
+            const message = this._encodeRequest(identity, MESSAGES.QUERY, Buffer.concat([this.knownPeers[identity][3], payload]));
+            const [res_message, res_data] = await this._sendAndWait(identity, message, res_timeout, ack_timeout);
+            let result_data = null;
+            if (res_data.length > 0) result_data = this.crypto.AESDecrypt(this.knownPeers[identity][2], res_data);
+            switch (res_message) {
+                case MESSAGES.SESSION_INVALID:
+                    if (triedNewSession) throw new Error('Failed to get a vaild session with the peer!');
+                    await this.requestSession(identity);
+                    triedNewSession = true;
+                    break;
+                case MESSAGES.QUERY_REFUSED:
+                    return [-1, result_data];
+                    break;
+                case MESSAGES.QUERY_FAILURE:
+                    return [0, result_data];
+                    break;
+                case MESSAGES.QUERY_SUCCESS:
+                    return [1, result_data];
+                    break;
+                default:
+                    throw new Error(`Received bad status code from peer: ${res_message}`);
+                    break;
+            }
         }
-    }
-    async _sendQueryResponse(msg, message, data) {
-        if (!this.knownPeers[msg.senderIdentityString]) await this.locate(msg.senderIdentityString);
-        if (typeof data === 'string') data = Buffer.from(data);
-        const response = this._encodeMessage(msg.senderIdentityString, message, this.crypto.encrypt(msg.senderPubKey, Buffer.concat([msg.id, data])));
-        this.streams[this.knownPeers[msg.senderIdentityString][0]].sendMessage(response.buffer);
-    }
-    async sendDiscover() {
-        for (const stream in this.streams) this.streams[stream].sendMessage(this._encodeMessage(this.broadcastIdentity, MESSAGES.DISCOVER).buffer);
     }
 }
 
