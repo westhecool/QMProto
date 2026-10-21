@@ -390,6 +390,7 @@ class QMProto extends EventEmitter {
     async query(identity, data, res_timeout = 30000, ack_timeout = 10000) {
         if (typeof identity !== 'string') throw new Error('Identity is required.');
         if (!data || data.length < 0) throw new Error('Data is required.');
+        if (typeof data === 'string') data = Buffer.from(data, 'utf-8');
         if (!this.knownPeers[identity] || this.knownPeers[identity][2] === null) await this.requestSession(identity);
         let triedNewSession = false;
         while (true) {
